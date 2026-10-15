@@ -172,6 +172,15 @@ impl Importing {
             .set_parent(&ui.window().window_handle())
             .pick_folder()
         else {
+            // rfd reports both "the user cancelled" and "the dialog never
+            // opened" as None, so a cancelled pick is logged at debug and a
+            // genuinely broken portal is invisible to the user. This is the
+            // log line worth having: on Linux a container with no session bus
+            // (or a bare `podman exec`, which drops DBUS_SESSION_BUS_ADDRESS)
+            // silently does nothing here.
+            tracing::debug!(
+                "folder dialog returned nothing (cancelled, or no portal/session bus)"
+            );
             return;
         };
         import.set_error("".into());
