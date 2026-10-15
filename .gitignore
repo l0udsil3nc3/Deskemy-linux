@@ -10,3 +10,8 @@
 /.agents/
 /.claude/
 /skills-lock.json
+
+# Local Linux build outputs — regenerable, never commit
+/*.AppImage
+/Deskemy.AppDir/
+/deskemy-linux-snapshot.png
