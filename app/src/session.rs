@@ -231,10 +231,22 @@ impl Session {
         let _ = queries::set_last_lecture(&db, &course_id, &item.lecture_id);
         drop(db);
 
-        // loadfile <url> [<flags> [<index> [<options>]]] — options is the 4th arg.
+        // Resume goes in loadfile's *options* argument, but the argument list
+        // changed shape in mpv 0.38:
+        //   0.38+: loadfile <url> [<flags> [<index>  [<options>]]]  -> 4th
+        //   older: loadfile <url> [<flags> [<options>]]             -> 3rd
+        // Each version rejects the other's form outright with "invalid
+        // parameter" (mpv error -4) — and on 0.37 (Ubuntu 24.04) the modern
+        // form doesn't even load the file, so resume doesn't degrade, it
+        // breaks (roadmap, Linux).
+        // `start` as a property is NOT a way out: 0.37 ignores it, and where it
+        // is honoured it seeks the *current* file when one is playing. So send
+        // the modern form and, if mpv refuses it, the older one.
         let loaded = if start > 1.0 {
+            let opts = format!("start={start}");
             self.mpv
-                .command(&["loadfile", &item.path, "replace", "0", &format!("start={start}")])
+                .command(&["loadfile", &item.path, "replace", "0", &opts])
+                .or_else(|_| self.mpv.command(&["loadfile", &item.path, "replace", &opts]))
         } else {
             self.mpv.command(&["loadfile", &item.path])
         };
@@ -677,9 +689,9 @@ mod tests {
     }
 
     #[test]
-    // Resuming loads with `loadfile <url> replace 0 start=…`: the index
-    // argument is mpv 0.38+, and Ubuntu 24.04 has 0.37 (roadmap, Linux).
-    #[cfg_attr(not(windows), ignore = "resume needs mpv 0.38's loadfile; see the roadmap's Linux list")]
+    // Resuming rides in loadfile's options argument, whose position changed in
+    // mpv 0.38 (index inserted before it). On Ubuntu 24.04's 0.37 the modern
+    // form is rejected outright, so load_current falls back to the older one.
     fn no_position_or_leaving_the_player_never_wipes_progress() {
         let Some(mpv) = headless_mpv() else { return };
         let (_tmp, db, lectures) = library();
