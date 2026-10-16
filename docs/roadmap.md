@@ -110,12 +110,17 @@ checklist live in [slint-port.md](slint-port.md).
 - Build and test on Ubuntu: `.github/workflows/slint-linux.yml` (CI only — it
   publishes nothing; releases stay Windows-only until Linux is reviewed).
 - Run it: playback with `hwdec=auto-safe` (VA-API), on X11 and Wayland.
-- **Resume needs mpv 0.38** (found by CI): a lecture with a saved position
-  loads with `loadfile <url> replace 0 start=…`, and the index argument
-  (`0`) is new in 0.38. Ubuntu 24.04 has 0.37, so resuming fails there
-  (mpv error -4). Use the named-argument form, or set `start` as a property
-  before `loadfile` (and reset it for loads without one). Then un-ignore
-  `no_position_or_leaving_the_player_never_wipes_progress` on Linux.
+- [x] **Resume on mpv 0.37** (found by CI; fixed): a saved position rides in
+      `loadfile <url> replace 0 start=…`, but the index (`0`) is new in mpv
+      0.38 — Ubuntu 24.04's 0.37 rejects the whole command (error -4), so the
+      lecture failed to open, not merely restart from 0. The fix sends the
+      0.38 form and falls back to `loadfile <url> replace start=…` (options
+      3rd) when mpv rejects it — the error picks the version, nothing to
+      sniff. Setting `start` as a property instead (the plan written here)
+      does **not** work: 0.37 ignores it, and where honoured it seeks the
+      file already playing rather than the one about to load. Its test runs
+      again — `no_position_or_leaving_the_player_never_wipes_progress`,
+      77/77 on 0.37 (Ubuntu 24.04) and 0.41 (Fedora 44).
 - Keep-awake during playback (freedesktop ScreenSaver inhibit; macOS:
   IOPMAssertion) — Windows only today.
 - rfd's backend: GTK 3 (default) or the XDG portal.
@@ -125,7 +130,9 @@ checklist live in [slint-port.md](slint-port.md).
   it lands. The Windows-only parts (work area, SetWindowPos, DWM cloaking,
   the app-driven drag, WM_DPICHANGED) are behind `cfg(windows)` in `mini.rs`.
 - Packaging: AppImage and/or Flatpak; the updater's Linux entry in
-  `latest.json`.
+  `latest.json`. The AppImage recipe is in the tree — see
+  `packaging/appimage/` (build, pack, verify). Publishing it and the
+  updater entry are what's left.
 
 ## Feature ideas
 
