@@ -163,7 +163,11 @@ export component MiniPlayer inherits Rectangle {
                     y: parent.height - self.height - 4px;
                     width: parent.width - 20px;
                     value: root.progress;
-                    committed(v) => { Playback.seek(v * Playback.duration); }
+                    hold: Playback.scrub-hold;
+                    committed(v) => {
+                        Playback.scrub-hold = true;
+                        Playback.seek(v * Playback.duration);
+                    }
                 }
             }
 

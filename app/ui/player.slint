@@ -102,6 +102,10 @@ export global Playback {
     in property <string> up-next;
     in property <float> position;
     in property <float> duration;
+    /// A seek-bar click is on its way: its bar holds the clicked point until
+    /// the real position arrives (set by the seek bar's `committed`, cleared
+    /// by the pump — see `PendingSeek` in video.rs).
+    in-out property <bool> scrub-hold;
     in property <bool> paused;
     in property <float> volume: 100;
     in property <bool> muted;
@@ -227,13 +231,17 @@ export component Scrubber inherits Rectangle {
     in property <float> value;
     out property <float> preview;
     out property <bool> dragging: touch.pressed;
+    /// While a committed seek travels, keep the committed point on screen
+    /// instead of the stale value — wired only by the seek bars (the volume
+    /// bar follows live and never holds).
+    in property <bool> hold: false;
     callback changed(float);
     callback committed(float);
     /// Track height at rest (two pixels thicker under the pointer).
     in property <length> thickness: 3px;
     in property <length> thumb: 13px;
 
-    property <float> shown: max(0, min(1, touch.pressed ? root.preview : root.value));
+    property <float> shown: max(0, min(1, touch.pressed || root.hold ? root.preview : root.value));
     property <length> track: touch.has-hover || touch.pressed ? root.thickness + 2px : root.thickness;
 
     height: 20px;
@@ -759,7 +767,7 @@ export component PlayerOverlay inherits Rectangle {
                 HorizontalLayout {
                     spacing: 14px;
                     Text {
-                        text: root.time(seek-bar.dragging ? seek-bar.preview * Playback.duration : Playback.position);
+                        text: root.time(seek-bar.dragging || Playback.scrub-hold ? seek-bar.preview * Playback.duration : Playback.position);
                         color: #ffffff;
                         font-size: 13px;
                         vertical-alignment: center;
@@ -770,7 +778,11 @@ export component PlayerOverlay inherits Rectangle {
                         thickness: 6px;
                         thumb: 16px;
                         value: Playback.duration > 0 ? Playback.position / Playback.duration : 0;
-                        committed(v) => { Playback.seek(v * Playback.duration); }
+                        hold: Playback.scrub-hold;
+                        committed(v) => {
+                            Playback.scrub-hold = true;
+                            Playback.seek(v * Playback.duration);
+                        }
                     }
                     Text {
                         text: "-" + root.time(max(0, Playback.duration - Playback.position));

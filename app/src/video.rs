@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 /// Work to run once mpv can draw (vo=libmpv has no output before that).
@@ -562,6 +562,63 @@ impl Drop for GlState<'_> {
     }
 }
 
+/// A committed seek the pump is waiting on: where the position should end
+/// up, when to stop waiting, and whether the seek borrowed the playing
+/// state to land (it must then hand the pause back).
+struct PendingSeek {
+    target: f64,
+    deadline: std::time::Instant,
+    restore_pause: bool,
+}
+static PENDING: Mutex<Option<PendingSeek>> = Mutex::new(None);
+
+/// What a click needs from mpv 0.41, probed on lecture files: a forward
+/// absolute seek is exact as a single command; a backward one lands on the
+/// keyframe *before* the target and plays through the gap unless an
+/// identical seek follows immediately; while paused a backward seek is
+/// dropped outright (the position reverts) whatever the flags, so it only
+/// lands from the playing state. Returns (unpause first, sends).
+fn seek_plan(backward: bool, paused: bool) -> (bool, u8) {
+    match (backward, paused) {
+        (false, _) => (false, 1),
+        (true, false) => (false, 2),
+        (true, true) => (true, 2),
+    }
+}
+
+/// A skip is an absolute target from here; it floors at zero — a negative
+/// absolute seek would wrap to the end of the file.
+fn seek_target(here: f64, delta: f64) -> f64 {
+    (here + delta).max(0.0)
+}
+
+/// Absolute seek the way mpv 0.41 actually lands one — see `seek_plan`.
+/// Records the pending watch the pump uses to release the seek bar's hold
+/// on its click point and to return a borrowed pause.
+fn seek_absolute(mpv: &Mpv, target: f32) {
+    let target = f64::from(target);
+    let here = mpv.get_f64("time-pos").unwrap_or(target);
+    let paused = mpv.get_property_string("pause").as_deref() == Some("yes");
+    let (unpause, sends) = seek_plan(target < here - 0.05, paused);
+    if unpause {
+        if let Err(e) = mpv.set_property("pause", "no") {
+            tracing::warn!(error = %e, "unpause to seek");
+        }
+    }
+    let to = format!("{target:.3}");
+    let args = ["seek", to.as_str(), "absolute"];
+    for _ in 0..sends {
+        if let Err(e) = mpv.command(&args) {
+            tracing::warn!(error = %e, ?args, "mpv command");
+        }
+    }
+    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingSeek {
+        target,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+        restore_pause: unpause,
+    });
+}
+
 /// Route the overlay's actions to mpv and the session.
 fn wire_controls(ui: &AppWindow, session: &Arc<Session>, mpv: &Arc<Mpv>) {
     let playback = ui.global::<Playback>();
@@ -579,9 +636,17 @@ fn wire_controls(ui: &AppWindow, session: &Arc<Session>, mpv: &Arc<Mpv>) {
         }
     });
     let m = mpv.clone();
-    playback.on_seek(move |t| run(&m, &["seek", &format!("{t:.3}"), "absolute"]));
+    playback.on_seek(move |t| seek_absolute(&m, t));
     let m = mpv.clone();
-    playback.on_seek_by(move |d| run(&m, &["seek", &format!("{d:.3}"), "relative"]));
+    playback.on_seek_by(move |d| {
+        // Relative seeks are the flaky ones (probed: a "+10" can stall
+        // while playing or be dropped while paused): skips become absolute
+        // targets from here, which land exactly through `seek_plan`.
+        match m.get_f64("time-pos") {
+            Some(here) => seek_absolute(&m, seek_target(here, f64::from(d)) as f32),
+            None => tracing::warn!(delta = d, "seek-by with no file"),
+        }
+    });
     let m = mpv.clone();
     playback.on_toggle_mute(move || run(&m, &["cycle", "mute"]));
     let m = mpv.clone();
@@ -743,7 +808,7 @@ fn wire_bookmarks(ui: &AppWindow, session: &Arc<Session>, mpv: &Arc<Mpv>) {
 
     let (m, done) = (mpv.clone(), close.clone());
     playback.on_jump_to_bookmark(move |position| {
-        let _ = m.command(&["seek", &format!("{position:.3}"), "absolute"]);
+        seek_absolute(&m, position);
         done();
     });
 
@@ -906,8 +971,14 @@ fn pump_events(mpv: &Mpv, session: &Session, stats_open: &AtomicBool, ui: slint:
     // What the last full refresh carried; a change in any of these — none of
     // which the fast path can move — makes the next wake a full one.
     let mut pushed = (false, 0.0_f64, false, 1.0_f64);
+    // Position of the previous wake, for "is it moving?" in the settle check.
+    let mut last_pos = f64::NAN;
     loop {
-        let event = mpv.wait_event(if playing { WAKE_PLAYING } else { WAKE_IDLE });
+        // A seek in flight keeps the pump at the fast cadence even while
+        // paused, so the bar's hold and any borrowed pause are settled
+        // without a 200ms pause-shaped gap.
+        let seeking = PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let event = mpv.wait_event(if playing || seeking { WAKE_PLAYING } else { WAKE_IDLE });
         let had_event = !event.is_null();
         if had_event {
             match unsafe { (*event).event_id } {
@@ -931,6 +1002,36 @@ fn pump_events(mpv: &Mpv, session: &Session, stats_open: &AtomicBool, ui: slint:
         }
 
         let s = State::sample(mpv);
+
+        // A seek in flight (`seek_absolute`): the seek bar holds its clicked
+        // point until the real position reaches the target — near it *and*
+        // moving, because an in-flight seek reports the target frozen, which
+        // `moving` rules out (while paused the reads are static by
+        // definition) — or the deadline passes. Either way: hand back a
+        // borrowed pause and drop the bar's hold.
+        let pos = s.position.unwrap_or(f64::NAN);
+        {
+            let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(p) = pending.as_mut() {
+                let near = pos.is_finite() && (pos - p.target).abs() < 0.3;
+                let moving = pos.is_finite() && last_pos.is_finite() && pos > last_pos;
+                if (near && (moving || s.paused)) || std::time::Instant::now() >= p.deadline {
+                    let restore = p.restore_pause;
+                    *pending = None;
+                    drop(pending);
+                    if restore {
+                        if let Err(e) = mpv.set_property("pause", "yes") {
+                            tracing::warn!(error = %e, "restore pause after seek");
+                        }
+                    }
+                    let _ = ui.upgrade_in_event_loop(|ui| {
+                        ui.global::<Playback>().set_scrub_hold(false);
+                    });
+                }
+            }
+        }
+        last_pos = pos;
+
         session.tick(s.position, s.duration, s.paused);
         playing = !s.paused && s.position.is_some();
 
@@ -1122,3 +1223,28 @@ fn set_keep_awake(on: bool) {
 
 #[cfg(not(windows))]
 fn set_keep_awake(_on: bool) {}
+
+#[cfg(test)]
+mod tests {
+    use super::{seek_plan, seek_target};
+
+    /// The probe matrix: forward exact with one command; backward needs the
+    /// immediate re-send; paused-backward borrows the playing state, which
+    /// the pump hands back.
+    #[test]
+    fn seek_plan_matrix() {
+        assert_eq!(seek_plan(false, false), (false, 1));
+        assert_eq!(seek_plan(false, true), (false, 1));
+        assert_eq!(seek_plan(true, false), (false, 2));
+        assert_eq!(seek_plan(true, true), (true, 2));
+    }
+
+    /// Skips are absolute targets from here; below zero they floor rather
+    /// than wrapping to the file's end.
+    #[test]
+    fn skips_floor_at_the_start() {
+        assert_eq!(seek_target(4.0, -10.0), 0.0);
+        assert_eq!(seek_target(100.0, -5.0), 95.0);
+        assert_eq!(seek_target(100.0, 5.0), 105.0);
+    }
+}
