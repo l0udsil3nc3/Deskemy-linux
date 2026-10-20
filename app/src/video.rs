@@ -880,18 +880,36 @@ impl State {
     }
 }
 
+/// mpv gives no event for `time-pos` (nothing observes it), so the seek bar
+/// moves only as fast as this loop wakes. While a lecture plays it wakes this
+/// often and pushes the position alone — at the old uniform ~5×/s the bar
+/// stepped visibly on a 60fps display.
+const WAKE_PLAYING: f64 = 0.033;
+/// Paused or stopped, nothing moves: the old, cheaper cadence.
+const WAKE_IDLE: f64 = 0.2;
+/// The full overlay refresh — tracks, menus, "Ends at", sleep, stats.
+const FULL_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// The player's long-lived thread: drains mpv's events (they must be
 /// drained), drives the session (end of file, periodic saves), keeps the
-/// machine awake while playing, and pushes state to the overlay ~5×/s.
+/// machine awake while playing, and pushes state to the overlay — whole at
+/// ~5×/s, and while playing just the position at ~30×/s, so the seek bar
+/// glides instead of stepping.
 fn pump_events(mpv: &Mpv, session: &Session, stats_open: &AtomicBool, ui: slint::Weak<AppWindow>) {
     let mut shown_revision = u64::MAX;
     let mut shown_tracks = None;
     let mut known_chapters = None;
     let mut awake = false;
     let mut filling = false;
+    let mut playing = false;
+    let mut last_full = std::time::Instant::now();
+    // What the last full refresh carried; a change in any of these — none of
+    // which the fast path can move — makes the next wake a full one.
+    let mut pushed = (false, 0.0_f64, false, 1.0_f64);
     loop {
-        let event = mpv.wait_event(0.2);
-        if !event.is_null() {
+        let event = mpv.wait_event(if playing { WAKE_PLAYING } else { WAKE_IDLE });
+        let had_event = !event.is_null();
+        if had_event {
             match unsafe { (*event).event_id } {
                 MPV_EVENT_SHUTDOWN => break,
                 MPV_EVENT_FILE_LOADED => {
@@ -914,6 +932,24 @@ fn pump_events(mpv: &Mpv, session: &Session, stats_open: &AtomicBool, ui: slint:
 
         let s = State::sample(mpv);
         session.tick(s.position, s.duration, s.paused);
+        playing = !s.paused && s.position.is_some();
+
+        // Between full refreshes the fast path carries just the position —
+        // the only thing that moves while playing. A real mpv event, a change
+        // in pause/volume/mute/speed, or FULL_EVERY makes one due.
+        let full_due = had_event
+            || last_full.elapsed() >= FULL_EVERY
+            || (s.paused, s.volume, s.muted, s.speed) != pushed;
+        if !full_due {
+            let position = s.position.unwrap_or(0.0);
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                ui.global::<Playback>().set_position(position as f32);
+            });
+            continue;
+        }
+        last_full = std::time::Instant::now();
+        pushed = (s.paused, s.volume, s.muted, s.speed);
+
         // The mini player keeps the video's shape; being that shape, the
         // video fills it (mpv keeping the aspect rounded 782.2px down to 782
         // and left a black column).

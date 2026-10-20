@@ -298,7 +298,8 @@ impl Session {
         Ok(())
     }
 
-    /// Called ~5×/s by the event thread with freshly sampled playback state:
+    /// Called on the event thread's every wake with freshly sampled playback
+    /// state — ~30×/s while playing, ~5×/s while paused or stopped:
     /// accumulates watch time and persists periodically. `position` is None
     /// while mpv has no file (stopped, or the next one still opening) — then
     /// there's nothing to save: writing 0 there wiped the lecture's real
